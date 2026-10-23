@@ -1,94 +1,62 @@
-import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const PAGE_URL = 'https://www.bible.com/es/verse-of-the-day';
 
-async function scrape() {
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({
-    locale: 'es-ES',
-    extraHTTPHeaders: { 'Accept-Language': 'es-ES,es;q=0.9' },
+async function fetchHtml() {
+  const res = await fetch(PAGE_URL, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'es-ES,es;q=0.9',
+      'Cache-Control': 'no-cache',
+    },
   });
-
-  // Interceptar respuestas JSON que contengan datos del versículo
-  let captured = null;
-  page.on('response', async (response) => {
-    if (captured) return;
-    const ct = response.headers()['content-type'] || '';
-    if (!ct.includes('json') || response.url().includes('/_next/')) return;
-    try {
-      const text = await response.text();
-      if (!text.includes('"text"') && !text.includes('"verse"')) return;
-      const data = JSON.parse(text);
-      const str = JSON.stringify(data);
-      if (str.includes('human_reference') || str.includes('votd') || str.includes('verse_of_the_day')) {
-        captured = data;
-      }
-    } catch {}
-  });
-
-  await page.goto('https://www.bible.com/es/verse-of-the-day', {
-    waitUntil: 'domcontentloaded',
-    timeout: 30000,
-  });
-
-  // Esperar a que React renderice el contenido (imagen o texto del versículo)
-  await page.waitForFunction(
-    () => document.querySelectorAll('img').length > 3,
-    { timeout: 15000 }
-  ).catch(() => {});
-  await page.waitForTimeout(2000);
-
-  // Extraer datos del DOM como fallback
-  const dom = await page.evaluate(() => {
-    // Imágenes de la tarjeta del versículo
-    const imgs = [
-      ...Array.from(document.querySelectorAll('img')).map(i => i.src),
-      ...Array.from(document.querySelectorAll('img[srcset]')).flatMap(i =>
-        i.srcset.split(',').map(s => s.trim().split(' ')[0])
-      ),
-    ].filter(s => s.includes('imageproxy.youversionapi.com'));
-
-    // __NEXT_DATA__
-    let nextData = null;
-    try {
-      const el = document.getElementById('__NEXT_DATA__');
-      if (el?.textContent) nextData = JSON.parse(el.textContent);
-    } catch {}
-
-    return {
-      imgs: [...new Set(imgs)],
-      nextData,
-      ogImage: document.querySelector('meta[property="og:image"]')?.content || '',
-      desc: document.querySelector('meta[name="description"]')?.content || '',
-      title: document.title,
-    };
-  });
-
-  await browser.close();
-  return { captured, dom };
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.text();
 }
 
-function parseVerse({ captured, dom }) {
-  // 1. Datos interceptados de la API interna
-  if (captured) {
-    const find = (obj, ...keys) => {
-      if (!obj || typeof obj !== 'object') return null;
-      for (const k of keys) if (obj[k] && typeof obj[k] === 'string') return obj[k];
-      for (const v of Object.values(obj)) { const r = find(v, ...keys); if (r) return r; }
-      return null;
-    };
-    const text = find(captured, 'text', 'verse_text', 'content');
-    const reference = find(captured, 'human_reference', 'reference');
-    const imageUrl = find(captured, 'url', 'image_url', 'src');
-    if (text || imageUrl) return { text: text || '', reference: reference || '', imageUrl };
-  }
+function extractNextData(html) {
+  const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  try { return m ? JSON.parse(m[1]) : null; } catch { return null; }
+}
 
-  // 2. __NEXT_DATA__
-  if (dom.nextData) {
-    const pp = dom.nextData?.props?.pageProps;
+function extractMeta(html, attr, value) {
+  const r1 = new RegExp(`<meta\\s+${attr}="${value}"\\s+content="([^"]*)"`, 'i');
+  const r2 = new RegExp(`<meta\\s+content="([^"]*)"\\s+${attr}="${value}"`, 'i');
+  return (html.match(r1) || html.match(r2))?.[1] || '';
+}
+
+function extractVerseImages(html) {
+  const seen = new Set();
+  const results = [];
+  for (const m of html.matchAll(/https:\/\/imageproxy\.youversionapi\.com\/(\d+x\d+)\/([^"'\s<>]+)/g)) {
+    const url = m[0];
+    if (url.includes('app-icons') || url.includes('app-icon')) continue;
+    if (!seen.has(url)) { seen.add(url); results.push(url); }
+  }
+  return results;
+}
+
+async function scrape() {
+  const html = await fetchHtml();
+
+  const nextData = extractNextData(html);
+  const ogImage = extractMeta(html, 'property', 'og:image');
+  const desc = extractMeta(html, 'name', 'description');
+  const titleMatch = html.match(/<title>([^<]*)<\/title>/);
+  const title = titleMatch?.[1] || '';
+  const imgs = extractVerseImages(html);
+
+  return { nextData, ogImage, desc, title, imgs };
+}
+
+function parseVerse({ nextData, ogImage, desc, title, imgs }) {
+  // 1. __NEXT_DATA__
+  if (nextData) {
+    const pp = nextData?.props?.pageProps;
     const votd = pp?.votd || pp?.verseOfTheDay || pp?.verse_of_the_day;
     if (votd) {
       const verse = votd.verse || votd;
@@ -96,17 +64,18 @@ function parseVerse({ captured, dom }) {
       return {
         text: verse.text || '',
         reference: verse.human_reference || verse.reference || '',
-        imageUrl: img?.url || img?.src || null,
+        imageUrl: img?.url || img?.src || imgs[0] || ogImage || null,
       };
     }
   }
 
-  // 3. DOM: imagen + título/descripción
-  const titleMatch = dom.title.match(/([A-ZÁÉÍÓÚ][a-záéíóúüñ]+(?:\s+[A-ZÁÉÍÓÚ]?[a-záéíóúüñ]+)?\s+\d+:\d+)/);
+  // 2. Images from page + meta text
+  // Title format: "Versículo del Día - PROVERBIOS 16:3 - Biblia App"
+  const refMatch = title.match(/[-–]\s*([^-–]+?\d+:\d+)\s*[-–]/);
   return {
-    text: dom.desc || '',
-    reference: titleMatch?.[1] || '',
-    imageUrl: dom.imgs[0] || dom.ogImage || null,
+    text: desc || '',
+    reference: refMatch?.[1]?.trim() || '',
+    imageUrl: ogImage || imgs[0] || null,
   };
 }
 
@@ -116,7 +85,7 @@ function generateHtml({ text, reference, imageUrl }) {
   const content = imageUrl
     ? `<img src="${escaped(imageUrl)}" alt="${escaped(reference)}" class="img" />`
     : `<div class="quote-card">
-        <span class="quote-mark">“</span>
+        <span class="quote-mark">"</span>
         <p class="verse-text">${escaped(text)}</p>
       </div>`;
 
@@ -203,8 +172,8 @@ function generateHtml({ text, reference, imageUrl }) {
 </html>`;
 }
 
-const { captured, dom } = await scrape();
-const verse = parseVerse({ captured, dom });
+const { nextData, ogImage, desc, title, imgs } = await scrape();
+const verse = parseVerse({ nextData, ogImage, desc, title, imgs });
 
 console.log('📖', verse.reference || '(sin referencia)');
 console.log('🖼 ', verse.imageUrl ? 'imagen encontrada' : 'usando texto');
